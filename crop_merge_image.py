@@ -9,9 +9,13 @@
 
 import os
 from skimage import io
-from osgeo import gdal, osr
+import geopandas as gpd
+from osgeo import gdal, osr, ogr
+from affine import Affine
 import numpy as np
 from PIL import Image
+import rasterio as rio
+from rasterio import features
 
 class GRID:
     # 裁剪jpg或png图片
@@ -351,17 +355,21 @@ class GRID:
             geo_5 = line.split('*_&')[7]
             info.append([file_name, proj, geo_0, geo_1, geo_2, geo_3, geo_4, geo_5])
 
-        # 设置对应tif文件的投影信息和地理坐标
+        # 将地理坐标和投影信息写入tif文件
         for i in range(len(file_list)):
-            ds = gdal.Open(file_list[i], gdal.GA_Update)
-            # 找到对应文件名的投影信息和地理坐标
             for j in range(len(info)):
-                if info[j][0] == file_list[i]:
-                    ds.SetProjection(info[j][1])
-                    ds.SetGeoTransform((float(info[j][2]), float(info[j][3]), float(info[j][4]), float(info[j][5]), float(info[j][6]), float(info[j][7])))
+                # 预测结果文件名与原始tif文件名一致
+                if os.path.split(file_list[i])[-1] == os.path.split(info[j][0])[-1]:
+                    ds = gdal.Open(file_list[i])
+                    ds_with_coord = gdal.GetDriverByName('GTiff').CreateCopy(os.path.split(file_list[i])[0] + '/temp.tif', ds)
+                    ds_with_coord.SetProjection(info[j][1])
+                    ds_with_coord.SetGeoTransform([float(info[j][2]), float(info[j][3]), float(info[j][4]), float(info[j][5]), float(info[j][6]), float(info[j][7])])
+                    ds_with_coord = None
+                    ds = None
+                    os.remove(file_list[i])
+                    os.rename(os.path.split(file_list[i])[0] + '/temp.tif', file_list[i])
                     break
-            ds = None
-
+        
         # 创建vrt(虚拟文件)
         vrt = gdal.BuildVRT('temp.vrt', file_list)
         # vrt文件转为tif
@@ -392,14 +400,217 @@ class GRID:
             # 判断文件类型
             if file.endswith('.jpg') or file.endswith('.jpeg') or file.endswith('.png'):
                 # 切割图片
-                GRID().crop_image(file, save_path, crop_size, is_supplement)
+                GRID.crop_image(file, save_path, crop_size, is_supplement)
             elif file.endswith('.tif') or file.endswith('.tiff'):
                 # 切割tif
-                GRID().crop_tif(file, save_path, crop_size, is_supplement)
+                GRID.crop_tif(file, save_path, crop_size, is_supplement)
             else:
                 print('Error: {} is not image or tif file.'.format(file))
                 continue
         print('Success batch cut image or tif file.')
+    
+    
+    # 栅格转矢量
+    @staticmethod
+    def raster_to_vector(file_path, save_path, txt_path = None):
+        '''
+        :param file_path: 待转换mask tif文件
+        :param save_path: 转换后文件保存文件夹
+        :txt_path: 坐标文件, 用于与Tif文件重叠
+        :return: raster to vector
+        '''
+        # 读取tif文件
+        ds = gdal.Open(file_path)
+        if ds is None:
+            print('Error: {} is not tif file.'.format(file_path))
+            return
+
+        # 获取tif文件的投影信息和地理坐标
+        prj = osr.SpatialReference()
+        prj.ImportFromWkt(ds.GetProjection())  # 读取栅格数据的投影信息
+
+        # 如果有txt坐标文件，优先使用txt文件的投影信息和地理坐标
+        if txt_path is not None:
+            with open(txt_path, 'r') as f:
+                lines = f.readlines()
+            # 查找对应文件名的投影信息和地理坐标
+            for line in lines:
+                if line.split('*_&')[0] == file_path:
+                    # 获取投影信息和地理坐标
+                    prj = line.split('*_&')[1]
+                    break
+        # 获取tif文件的波段数据
+        band_data = ds.GetRasterBand(1)
+        # 保存为shp文件
+        # 创建shp文件
+        driver = ogr.GetDriverByName('ESRI Shapefile')
+        # 若文件存在则删除
+        if os.path.exists(save_path):
+            driver.DeleteDataSource(save_path)
+        ds_shp = driver.CreateDataSource(save_path)
+        # 创建图层
+        layer = ds_shp.CreateLayer(os.path.splitext(os.path.split(save_path)[1])[0], prj, ogr.wkbPolygon)
+        # 创建属性表
+        field_name = ogr.FieldDefn('value', ogr.OFTReal)
+        layer.CreateField(field_name)
+        gdal.Polygonize(band_data, None, layer, 0)
+        # 释放资源
+        ds_shp.SyncToDisk()
+        ds_shp = None
+
+        # 读取shp文件
+        ds_result = ogr.Open(save_path.replace('.tif', '.shp'), gdal.GA_Update)
+        # 删除shp属性表最后一行并保存
+        # print(layer.GetFeatureCount())
+        layer = ds_result.GetLayer(0)
+        layer.DeleteFeature(layer.GetFeatureCount() - 1)
+        # 释放资源
+        ds_result.SyncToDisk()
+        ds_result = None
+        
+        print('Success raster to vector. save path: {}'.format(save_path.replace('.tif', '.shp')))
+
+    # 矢量转栅格
+    @staticmethod
+    def vector_to_raster(shp_file_path, save_path, tif_file_path, output_channel = 'single'):
+        '''
+        :param shp_file_path: 待转换shp文件
+        :param save_path: 转换后文件保存文件夹
+        :param tif_file_path: 用于获取tif文件的图像大小范围
+        :param output_format: 输出文件格式
+        :param output_channel: 输出通道数
+        :return: vector to raster
+        '''
+        # 读取shp文件
+        shapefile = gpd.read_file(shp_file_path)
+        if shapefile is None:
+            raise Exception('Error: {} is not shp file.'.format(shp_file_path))
+        # 读取tif文件
+        ds = gdal.Open(tif_file_path)
+        if ds is None:
+            print('Error: {} is not tif file.'.format(tif_file_path))
+            return
+        # 获取tif文件的图像大小范围
+        xsize = ds.RasterXSize
+        ysize = ds.RasterYSize
+        # 获取tif文件的投影信息和地理坐标
+        prj = ds.GetProjection()
+        geotransform = ds.GetGeoTransform()
+        afn = Affine.from_gdal(*geotransform)
+        # 通道数
+        if output_channel == 'single':
+            channel = 1
+        elif output_channel == 'multi':
+            channel = 3
+        else:
+            raise Exception('Error: output_channel must be single or multi.')
+        
+        meta = {'driver': 'GTiff',
+                'height': ysize,
+                'width': xsize,
+                'count': channel,
+                'dtype': 'uint8',
+                'crs': prj,
+                'transform': afn,
+                'nodata': 2}    # nodata = 2, 用于区分背景和边界，不占用背景像素值0
+        
+        # 单通道则每块矢量图斑内部填充为1，多通道则每块矢量图斑内部填充为[255, 255, 255]
+        if output_channel == 'single':
+            fill_value = 1
+        elif output_channel == 'multi':
+            fill_value = 255
+        field_val = [fill_value] * len(shapefile.geometry)
+
+        # 无论是什么格式的影像，先作为tif处理
+        if save_path.endswith('.tif') or save_path.endswith('.tiff'):
+            save_temp_path = save_path
+        elif save_path.endswith('.jpg') or save_path.endswith('.jpeg') or save_path.endswith('.png'):
+            save_temp_path = save_path.replace(save_path.split('.')[-1], 'tif')
+        else:
+            raise Exception('Error: {} is not support format.'.format(save_path.split('.')[-1]))
+        
+        # 如果保存文件存在则先删除
+        if os.path.exists(save_path):
+            os.remove(save_path)
+        if os.path.exists(save_temp_path):
+            os.remove(save_temp_path)
+        # 创建tif文件，背景填充为0
+        with rio.open(save_temp_path, 'w', **meta) as out:
+            if channel == 1:
+                out.write(np.zeros((ysize, xsize), dtype=np.uint8), 1)
+            elif channel == 3:
+                out.write(np.zeros((3, ysize, xsize), dtype=np.uint8), [1, 2, 3])
+        # 读取tif文件
+        with rio.open(save_temp_path, 'r+') as out:
+            for i in range(channel):
+                out_arr = out.read(i + 1)
+                # 读取shp文件
+                shapes = ((geom, value) for geom, value in zip(shapefile.geometry, field_val))
+                burned = features.rasterize(shapes=shapes, fill=0, out=out_arr, transform=out.transform)
+                out.write_band(i + 1, burned)
+        
+        # 如果为多通道则直接保存
+        if channel == 3:
+            if save_path.endswith('.jpg') or save_path.endswith('.jpeg'):
+                os.system('gdal_translate -of JPEG {} {}'.format(save_temp_path, save_path))
+                os.remove(save_temp_path)
+            elif save_path.endswith('.png'):
+                os.system('gdal_translate -of PNG {} {}'.format(save_temp_path, save_path))
+                os.remove(save_temp_path)
+            print('Success vector to raster. save path: {}'.format(save_path))
+            return
+        
+        # 单通道处理
+        # 设置tif文件位深度为1位
+        # 先转灰度图
+        img_l = Image.open(save_temp_path).convert('L')
+        # 再转二值图
+        img_b = img_l.point(lambda x: 0 if x < 1 else 1, '1')
+        # 保存
+        img_b.save(save_temp_path)
+        
+        # 如果为保存为tif，转位深会丢失投影信息和地理坐标，所以需要重新设置
+        # 设置投影信息和地理坐标
+        ds = gdal.Open(save_temp_path, gdal.GA_Update)
+        ds.SetProjection(prj)
+        ds.SetGeoTransform(geotransform)
+        # 释放资源
+        ds = None
+            
+        if save_path.endswith('.jpg') or save_path.endswith('.jpeg'):
+            os.system('gdal_translate -of JPEG {} {}'.format(save_temp_path, save_path))
+            os.remove(save_temp_path)
+        elif save_path.endswith('.png'):
+            os.system('gdal_translate -of PNG {} {}'.format(save_temp_path, save_path))
+            os.remove(save_temp_path)
+        
+        print('Success vector to raster. save path: {}'.format(save_path))
+        
+        
+        
+    
+    # 生成坐标文件
+    @staticmethod
+    def generate_txt(file_path, save_path):
+        '''
+        :param file_path: 待生成坐标文件的tif文件
+        :param save_path: 生成坐标文件保存路径
+        :return: generate txt
+        '''
+        # 读取tif文件
+        ds = gdal.Open(file_path)
+        if ds is None:
+            print('Error: {} is not tif file.'.format(file_path))
+            return
+        # 获取tif文件的投影信息和地理坐标
+        prj = osr.SpatialReference()
+        prj.ImportFromWkt(ds.GetProjection())  # 读取栅格数据的投影信息
+        geo = ds.GetGeoTransform()
+        # 生成坐标文件
+        with open(save_path, 'w') as f:
+            f.write('{}*_&{}*_&{}*_&{}*_&{}*_&{}*_&{}*_&{}'.format(file_path, prj, geo[0], geo[1], geo[2], geo[3], geo[4], geo[5]))
+            f.write('\n')
+        print('Success generate txt. save path: {}'.format(save_path))
 
                 
 
@@ -413,8 +624,16 @@ if __name__ == '__main__':
     # save_path = r'C:\Users\69452\Desktop\mon\9_30日晚之前\data\merge_crop2.tif'
     # file_path = r'C:\Users\69452\Desktop\mon\10.7日任务\裁剪测试数据'
     # save_path = r'C:\Users\69452\Desktop\mon\10.7日任务\cut\\'
-    file_path = r'C:\Users\69452\Desktop\mon\10.7日任务\cut_2'
-    save_path = r'C:\Users\69452\Desktop\mon\10.7日任务\merge_crop.tif'
+    # file_path = r'C:\Users\69452\Desktop\mon\10.7日任务\cut_2'
+    # save_path = r'C:\Users\69452\Desktop\mon\10.7日任务\merge_crop.tif'
+    # file_path = r'D:\jsnu\AI RS\WHU\image_label_croped\test\2_0_3_mask.tif'
+    # save_path = r'D:\jsnu\AI RS\WHU\image_label_croped\test'
+    # file_path = r'C:\Users\69452\Desktop\mon\10.7日任务\band3result'
+    # save_path = r'C:\Users\69452\Desktop\mon\10.7日任务\merge.tif'
+    file_path = r'C:\Users\69452\Desktop\mon\10.13日晚之前\测试数据\shp\building.shp'
+    save_path = r'C:\Users\69452\Desktop\mon\10.13日晚之前\测试数据\merge_shp_multi.tif'
+    tif_path = r'C:\Users\69452\Desktop\mon\10.13日晚之前\测试数据\raster\band3.tif'
+
 
     crop_size = 1000
 
@@ -422,4 +641,13 @@ if __name__ == '__main__':
     # GRID.crop_image(file_path, save_path, crop_size, is_supplement=True)
     # GRID.merge_tif(file_path, save_path)
     # GRID.merge_tif_with_proj(file_path, save_path, r'C:\Users\69452\Desktop\mon\10.7日任务\cut_2\band4_info.txt')
-    GRID.batch_cut(file_path, save_path, crop_size, is_supplement=True)
+    # GRID.batch_cut(file_path, save_path, crop_size, is_supplement=True)
+    # GRID.generate_txt(r'D:\jsnu\AI RS\WHU\image_label_croped\test\2_0_3.tif', r'D:\jsnu\AI RS\WHU\image_label_croped\test\2_0_3.txt')
+    # GRID.raster_to_vector(file_path, save_path, txt_path=r'D:\jsnu\AI RS\WHU\image_label_croped\test\2_0_3.txt')
+    # GRID.merge_tif_with_proj(file_path, save_path, r'C:\Users\69452\Desktop\mon\10.7日任务\band3_info.txt')
+    # GRID.raster_to_vector(save_path, save_path.replace('.tif', '.shp'))
+    
+    '''     两种模式：多通道和单通道    多波段 RGB分为（0,0,0）（255,255,255）  单波段，1bit，只含值0和1 (JPG无法调成1位深度，只能调成8位深度，其余可行)'''
+    '''     不同后缀名更改保存文件的后缀名即可    '''
+    GRID.vector_to_raster(file_path, save_path, tif_path, 'multi')
+    # GRID.vector_to_raster(file_path, save_path, tif_path, 'single')
