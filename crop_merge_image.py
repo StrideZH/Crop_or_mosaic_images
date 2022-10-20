@@ -175,12 +175,12 @@ class GRID:
 
         # 读取原图中的每个波段，通道数从1开始
         in_band = []
-        # 单波段Tif需要先进行色域转换，位深转为1位
+        # 单波段TIF
         if channel == 1:
             img = dataset.GetRasterBand(1).ReadAsArray()
             img = np.array(img, dtype=np.uint8)
             max_color = np.max(img)
-            img = np.where(img == max_color, 0, 255)
+            img = np.where(img == max_color, 255, 0)
             in_band.append(img)
         else:
             for i in range(channel):
@@ -249,6 +249,24 @@ class GRID:
                 # 将缓存写入磁盘，直接保存
                 out_data.FlushCache()
                 del out_data
+        
+                # 单通道处理
+                # 设置tif文件位深度为1位
+                # 先转灰度图
+                img_l = Image.open(output_name).convert('L')
+                # 再转二值图
+                img_b = img_l.point(lambda x: 0 if x < 1 else 1, '1')
+                # 保存
+                img_b.save(output_name)
+                
+                # 如果为保存为tif，转位深会丢失投影信息和地理坐标，所以需要重新设置
+                # 设置投影信息和地理坐标
+                ds = gdal.Open(output_name, gdal.GA_Update)
+                ds.SetProjection(proj)
+                ds.SetGeoTransform(new_transform)
+                # 释放资源
+                ds = None
+
         f.close()
         print('Success crop {} images.'.format(count))
 
@@ -630,14 +648,17 @@ if __name__ == '__main__':
     # save_path = r'D:\jsnu\AI RS\WHU\image_label_croped\test'
     # file_path = r'C:\Users\69452\Desktop\mon\10.7日任务\band3result'
     # save_path = r'C:\Users\69452\Desktop\mon\10.7日任务\merge.tif'
-    file_path = r'C:\Users\69452\Desktop\mon\10.13日晚之前\测试数据\shp\building.shp'
-    save_path = r'C:\Users\69452\Desktop\mon\10.13日晚之前\测试数据\merge_shp_multi.tif'
-    tif_path = r'C:\Users\69452\Desktop\mon\10.13日晚之前\测试数据\raster\band3.tif'
 
 
-    crop_size = 1000
+    # file_path = r'C:\Users\69452\Desktop\mon\10.13日晚之前\测试数据\shp\building.shp'
+    # save_path = r'C:\Users\69452\Desktop\mon\10.13日晚之前\测试数据\merge_shp_multi.tif'
+    # tif_path = r'C:\Users\69452\Desktop\mon\10.13日晚之前\测试数据\raster\band3.tif'
+    file_path = r'C:\Users\69452\Desktop\test\target.tif'
+    save_path = r'C:\Users\69452\Desktop\test\res'
 
-    # GRID.crop_tif(file_path, save_path, crop_size, is_supplement=True)
+    crop_size = 512
+
+    GRID.crop_tif(file_path, save_path, crop_size, is_supplement=True)
     # GRID.crop_image(file_path, save_path, crop_size, is_supplement=True)
     # GRID.merge_tif(file_path, save_path)
     # GRID.merge_tif_with_proj(file_path, save_path, r'C:\Users\69452\Desktop\mon\10.7日任务\cut_2\band4_info.txt')
@@ -649,5 +670,5 @@ if __name__ == '__main__':
     
     '''     两种模式：多通道和单通道    多波段 RGB分为（0,0,0）（255,255,255）  单波段，1bit，只含值0和1 (JPG无法调成1位深度，只能调成8位深度，其余可行)'''
     '''     不同后缀名更改保存文件的后缀名即可    '''
-    GRID.vector_to_raster(file_path, save_path, tif_path, 'multi')
+    # GRID.vector_to_raster(file_path, save_path, tif_path, 'multi')
     # GRID.vector_to_raster(file_path, save_path, tif_path, 'single')
