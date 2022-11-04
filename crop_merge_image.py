@@ -16,6 +16,7 @@ import numpy as np
 from PIL import Image
 import rasterio as rio
 from rasterio import features
+import time
 
 class GRID:
     # 裁剪jpg或png图片
@@ -31,6 +32,10 @@ class GRID:
         # 获取文件名
         file_dir, file_name_ex = os.path.split(file_path)
         file_name, extension = os.path.splitext(file_name_ex)
+
+        '''测试'''
+        extension = '.jpg'
+
         # 保存路径存在
         if not os.path.exists(save_path):
             os.makedirs(save_path)
@@ -75,7 +80,7 @@ class GRID:
                     if hb and j == num_height - 1:
                         offset_height = height - crop_size
                     # 裁成三通道
-                    cropped = img[offset_width: offset_width + crop_size, offset_height: offset_height + crop_size, :]
+                    cropped = img[offset_width: offset_width + crop_size, offset_height: offset_height + crop_size, :3]
                     # 保存为 原文件名_裁剪行号_裁剪列号.tif
                     io.imsave(os.path.join(save_path, '{}_{}_{}'.format(file_name, i, j) + extension), cropped)
                     p += 1
@@ -488,6 +493,57 @@ class GRID:
         
         print('Success raster to vector. save path: {}'.format(save_path.replace('.tif', '.shp')))
 
+    @staticmethod
+    def raster2vector(raster_path, vecter_path, field_name="value", ignore_values=None):
+        """
+        栅格转化为矢量
+        :param raster_path: 栅格图像路径
+        :param vecter_path: 输出矢量文件路径
+        :param field_name: 字段名
+        :param ignore_values: 忽略的类别
+        """
+        # 读取路径中的栅格数据
+        raster = gdal.Open(raster_path)
+        # in_band 为想要转为矢量的波段,一般需要进行转矢量的栅格都是单波段分类结果
+        # 若栅格为多波段,需要提前转换为单波段
+        band = raster.GetRasterBand(1)
+
+        # 读取栅格的投影信息,为后面生成的矢量赋予相同的投影信息
+        prj = osr.SpatialReference()
+        prj.ImportFromWkt(raster.GetProjection())
+
+        drv = ogr.GetDriverByName("ESRI Shapefile")
+        # 若文件已经存在,删除
+        if os.path.exists(vecter_path):
+            drv.DeleteDataSource(vecter_path)
+
+        # 创建目标文件
+        polygon = drv.CreateDataSource(vecter_path)
+        # 创建面图层
+        poly_layer = polygon.CreateLayer(vecter_path[:-4], srs=prj, geom_type=ogr.wkbMultiPolygon)
+        # 添加浮点型字段,用来存储栅格的像素值
+        field = ogr.FieldDefn(field_name, ogr.OFTReal)
+        poly_layer.CreateField(field)
+
+        # FPolygonize将每个像元转成一个矩形，然后将相似的像元进行合并
+        # 设置矢量图层中保存像元值的字段序号为0
+        gdal.FPolygonize(band, None, poly_layer, 0)
+
+        # 删除ignore_value链表中的类别要素
+        if ignore_values is not None:
+            for feature in poly_layer:
+                class_value = feature.GetField('value')
+                for ignore_value in ignore_values:
+                    if class_value == ignore_value:
+                        # 通过FID删除要素
+                        poly_layer.DeleteFeature(feature.GetFID())
+                        break
+
+        polygon.SyncToDisk()
+        polygon = None
+        
+
+
     # 矢量转栅格
     @staticmethod
     def vector_to_raster(shp_file_path, save_path, tif_file_path, output_channel = 'single'):
@@ -630,35 +686,96 @@ class GRID:
             f.write('\n')
         print('Success generate txt. save path: {}'.format(save_path))
 
+    # 设置坐标文件
+    @staticmethod
+    def set_txt(tif_path, txt_path):
+        '''
+        :param tif_path: 待设置坐标文件的tif文件
+        :param txt_path: 待设置的坐标文件
+        :return: set txt
+        '''
+        # 读取tif文件
+        ds = gdal.Open(tif_path, gdal.GA_Update)
+        if ds is None:
+            print('Error: {} is not tif file.'.format(tif_path))
+            return
+        if txt_path is None:
+            print('Error: {} is not txt file.'.format(txt_path))
+            return
+        prj = ds.GetProjection()
+        pcs = osr.SpatialReference()
+        pcs.ImportFromWkt(prj)
+        # prj.ImportFromWkt(ds.GetProjection())  # 读取栅格数据的投影信息
+        geo = ds.GetGeoTransform()
+        # 读取坐标文件
+        with open(txt_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            for line in lines:
+                print(line.split('*_&')[0])
+                if line.split('*_&')[0] == tif_path:
+                    prj = line.split('*_&')[1]
+                    geo = [float(i) for i in line.split('*_&')[2:]]
+                    break
+        # 设置投影信息和地理坐标
+        ds.SetProjection(prj)
+        ds.SetGeoTransform(geo)
+        # 释放资源
+        ds = None
+        print('Success set projection and geotransform.')
+    
+    # 由小图（切割结果）坐标文件获取大图坐标和投影信息
+    @staticmethod
+    def get_big_img_info(txt_path):
+        '''
+        :param txt_path: 小图（切割结果）坐标文件
+        :return: 大图坐标和投影信息
+        '''
+        min_geo = [1e10, 1e10, 1e10, 1e10, 1e10, 1e10]
+        max_geo = [0, 0, 0, 0, 0, 0]
+
+        # 读取坐标文件
+        with open(txt_path, 'r') as f:
+            lines = f.readlines()
+            for line in lines:
+                prj = line.split('*_&')[1]
+                geo = [float(i) for i in line.split('*_&')[2:]]
+                min_geo[0] = min(min_geo[0], geo[0])
+                min_geo[1] = min(min_geo[1], geo[1])
+                min_geo[2] = min(min_geo[2], geo[2])
+                min_geo[3] = min(min_geo[3], geo[3])
+                min_geo[4] = min(min_geo[4], geo[4])
+                min_geo[5] = min(min_geo[5], geo[5])
+                max_geo[0] = max(max_geo[0], geo[0])
+                max_geo[1] = max(max_geo[1], geo[1])
+                max_geo[2] = max(max_geo[2], geo[2])
+                max_geo[3] = max(max_geo[3], geo[3])
+                max_geo[4] = max(max_geo[4], geo[4])
+                max_geo[5] = max(max_geo[5], geo[5])
+        # 输出大图坐标和投影信息
+        print('Success get big image info.')
+        print('prj: {}'.format(prj))
+        print('min_geo: {}'.format(min_geo))
+        print('max_geo: {}'.format(max_geo))
+        
                 
 
 if __name__ == '__main__':
-    # file_path = r'C:\Users\69452\Desktop\mon\9.30日晚之前\data\建筑物_h1182_w349_F42_dataset7.jpg'
-    # file_path = r'C:\Users\69452\Desktop\10.7日任务\裁剪测试数据\band3.tif'
-    # file_path = r'C:\Users\69452\Desktop\mon\9_30日晚之前\data\mosaic_output.tif'
-    # save_path = r'C:\Users\69452\Desktop\mon\9_30日晚之前\data\crop2'
-    # file_path = r'C:\Users\69452\Desktop\mon\9_30日晚之前\data\crop2'
-    # save_path = r'C:\Users\69452\Desktop\mon\9.30日晚之前\data\merge_gdal.tif'
-    # save_path = r'C:\Users\69452\Desktop\mon\9_30日晚之前\data\merge_crop2.tif'
-    # file_path = r'C:\Users\69452\Desktop\mon\10.7日任务\裁剪测试数据'
-    # save_path = r'C:\Users\69452\Desktop\mon\10.7日任务\cut\\'
-    # file_path = r'C:\Users\69452\Desktop\mon\10.7日任务\cut_2'
-    # save_path = r'C:\Users\69452\Desktop\mon\10.7日任务\merge_crop.tif'
-    # file_path = r'D:\jsnu\AI RS\WHU\image_label_croped\test\2_0_3_mask.tif'
-    # save_path = r'D:\jsnu\AI RS\WHU\image_label_croped\test'
-    # file_path = r'C:\Users\69452\Desktop\mon\10.7日任务\band3result'
-    # save_path = r'C:\Users\69452\Desktop\mon\10.7日任务\merge.tif'
+    file_path = r'E:\jsnu\#00_project\mon\11.3号之前\测试数据\newresult.tif'
+    save_path = r'E:\jsnu\#00_project\mon\11.3号之前/newresult.shp'
+    txt_path = r'E:\jsnu\#00_project\mon\11.3号之前\测试数据\coord.txt'
 
+    crop_size = 256
 
-    # file_path = r'C:\Users\69452\Desktop\mon\10.13日晚之前\测试数据\shp\building.shp'
-    # save_path = r'C:\Users\69452\Desktop\mon\10.13日晚之前\测试数据\merge_shp_multi.tif'
-    # tif_path = r'C:\Users\69452\Desktop\mon\10.13日晚之前\测试数据\raster\band3.tif'
-    file_path = r'C:\Users\69452\Desktop\test\target.tif'
-    save_path = r'C:\Users\69452\Desktop\test\res'
+    start = time.time()
+    # GRID.raster2vector(file_path, save_path, ignore_values=[0])
+    GRID.raster_to_vector(file_path, save_path)
+    # GRID.set_txt(file_path, txt_path)
+    end = time.time()
+    print('time: {}s'.format(end - start))
 
-    crop_size = 512
+    # GRID.fast_raster_to_vector(file_path, save_path)
 
-    GRID.crop_tif(file_path, save_path, crop_size, is_supplement=True)
+    # GRID.crop_tif(file_path, save_path, crop_size, is_supplement=True)
     # GRID.crop_image(file_path, save_path, crop_size, is_supplement=True)
     # GRID.merge_tif(file_path, save_path)
     # GRID.merge_tif_with_proj(file_path, save_path, r'C:\Users\69452\Desktop\mon\10.7日任务\cut_2\band4_info.txt')
